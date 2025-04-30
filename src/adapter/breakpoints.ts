@@ -2,6 +2,8 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import * as acorn from 'acorn';
+import * as walk from 'acorn-walk';
 import { inject, injectable } from 'inversify';
 import Cdp from '../cdp/api';
 import { ILogger, LogTag } from '../common/logging';
@@ -26,9 +28,17 @@ import { NeverResolvedBreakpoint } from './breakpoints/neverResolvedBreakpoint';
 import { PatternEntryBreakpoint } from './breakpoints/patternEntrypointBreakpoint';
 import { UserDefinedBreakpoint } from './breakpoints/userDefinedBreakpoint';
 import { DiagnosticToolSuggester } from './diagnosticToolSuggester';
-import { base0To1, base1To0, ISourceWithMap, isSourceWithMap, IUiLocation, Source } from './source';
+import {
+  base0To1,
+  base1To0,
+  ISourceWithMap,
+  isSourceWithMap,
+  IUiLocation,
+  LineColumn,
+  Source,
+} from './source';
 import { SourceContainer } from './sourceContainer';
-import { ScriptWithSourceMapHandler, Thread } from './threads';
+import { Script, ScriptWithSourceMapHandler, Thread } from './threads';
 
 /**
  * Differential result used internally in setBreakpoints.
@@ -130,6 +140,16 @@ export class BreakpointManager {
    */
   private readonly moduleEntryBreakpoints = urlUtils.caseNormalizedMap<EntryBreakpoint>();
 
+  /**
+   * Map of function names to their DAP FunctionBreakpoint requests.
+   */
+  private _functionBreakpoints = new Map<string, Dap.FunctionBreakpoint[]>();
+
+  /**
+   * List of scripts already seen, for re-applying function breakpoints.
+   */
+  private _parsedScripts: Script[] = [];
+
   constructor(
     @inject(IDapApi) dap: Dap.Api,
     @inject(SourceContainer) sourceContainer: SourceContainer,
@@ -146,12 +166,19 @@ export class BreakpointManager {
     _breakpointsPredictor?.onLongParse(() => dap.longPrediction({}));
 
     sourceContainer.onScript(script => {
+      // Keep track of parsed scripts
+      this._parsedScripts.push(script);
       script.source.then(source => {
         const thread = this._thread;
         if (thread) {
           this._byRef
             .get(source.sourceReference)
             ?.forEach(bp => bp.updateForNewLocations(thread, script));
+
+          // Try to apply any pending function breakpoints to this script
+          this._applyFunctionBreakpointsToScript(script).catch(err =>
+            this.logger.error(LogTag.Runtime, 'Error applying function breakpoints:', err)
+          );
         }
       });
     });
@@ -851,6 +878,146 @@ export class BreakpointManager {
     if (this._thread) {
       const thread = this._thread;
       await Promise.all(all.map(a => a.enable(thread)));
+    }
+  }
+
+  /**
+   * Handles DAP setFunctionBreakpoints request.
+   * NOTE: This is a placeholder implementation.
+   */
+  public async setFunctionBreakpoints(
+    params: Dap.SetFunctionBreakpointsParams,
+  ): Promise<Dap.SetFunctionBreakpointsResult> {
+    this.logger.info(LogTag.Runtime, 'Received setFunctionBreakpoints request:', params);
+    // Store requested function breakpoints by name
+    this._functionBreakpoints.clear();
+    for (const fb of params.breakpoints) {
+      const arr = this._functionBreakpoints.get(fb.name) || [];
+      arr.push(fb);
+      this._functionBreakpoints.set(fb.name, arr);
+    }
+    // Re-apply to all previously parsed scripts
+    for (const script of this._parsedScripts) {
+      this._applyFunctionBreakpointsToScript(script).catch(err =>
+        this.logger.error(LogTag.Runtime, 'Error re-applying function breakpoints:', err)
+      );
+    }
+
+    // TODO: Implement actual logic to:
+    // 1. Clear existing function breakpoints.
+    // 2. Store the new desired function breakpoints (params.breakpoints).
+    // 3. Hook into script parsing (like in the constructor's onScript handler)
+    //    to find locations matching these names and set actual CDP breakpoints.
+    // 4. Return verified breakpoint information here.
+
+    // For now, return an empty list, indicating no breakpoints are verified yet.
+    const result: Dap.SetFunctionBreakpointsResult = {
+      breakpoints: params.breakpoints.map((_bp, i) => ({
+        // Provide a temporary, unverified breakpoint structure for each requested one.
+        // Using negative IDs might help distinguish them initially.
+        id: -(i + 1), // Temporary ID
+        verified: false,
+        message: 'Function breakpoint not yet implemented or resolved.',
+      })),
+    };
+
+    return result;
+  }
+
+  /**
+   * Parse a newly loaded script and set breakpoints on functions matching requested names.
+   */
+  private async _applyFunctionBreakpointsToScript(script: Script): Promise<void> {
+    const thread = this._thread;
+    if (!thread || this._functionBreakpoints.size === 0) {
+      return;
+    }
+    // Fetch the script source from the runtime
+    let sourceResp: Cdp.Debugger.GetScriptSourceResult | undefined;
+    try {
+      sourceResp = await thread.cdp().Debugger.getScriptSource({ scriptId: script.scriptId });
+    } catch (e) {
+      this.logger.error(LogTag.Runtime, `Failed to get script source for ${script.scriptId}`, e);
+      return;
+    }
+    const code = sourceResp?.scriptSource;
+    if (!code) {
+      return;
+    }
+    // Parse into an AST with location info
+    let ast: acorn.Node;
+    try {
+      ast = acorn.parse(code, {
+        ecmaVersion: 'latest',
+        sourceType: 'module',
+        locations: true,
+      });
+    } catch (e) {
+      this.logger.error(LogTag.Runtime, `Failed to parse script ${script.scriptId}`, e);
+      return;
+    }
+    // Walk the AST and find function declarations/expressions and methods matching names
+    const names = new Set(this._functionBreakpoints.keys());
+    const matches: Array<{ name: string; loc: LineColumn }> = [];
+    // Attempt function breakpoint parsing; ignore type mismatches
+    /* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call */
+    walk.simple(ast as any, {
+      FunctionDeclaration(node: any) {
+        const id = node.id;
+        const loc = node.loc;
+        if (id?.name && names.has(id.name) && loc) {
+          const start = loc.start;
+          matches.push({
+            name: id.name,
+            loc: {
+              lineNumber: start.line,
+              columnNumber: start.column + 1,
+            },
+          });
+        }
+      },
+      FunctionExpression(node: any) {
+        const id = node.id;
+        const loc = node.loc;
+        if (id?.name && names.has(id.name) && loc) {
+          const start = loc.start;
+          matches.push({
+            name: id.name,
+            loc: { lineNumber: start.line, columnNumber: start.column + 1 },
+          });
+        }
+      },
+      MethodDefinition(node: any) {
+        const key = node.key;
+        const value = node.value;
+        if (key?.type === 'Identifier' && names.has(key.name) && value?.loc) {
+          const start = value.loc.start;
+          matches.push({
+            name: key.name,
+            loc: { lineNumber: start.line, columnNumber: start.column + 1 },
+          });
+        }
+      },
+    });
+    /* eslint-enable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call */
+    // Set breakpoints at each match
+    for (const { name, loc } of matches) {
+      const fps = this._functionBreakpoints.get(name)!;
+      for (const fb of fps) {
+        const bpParams: Cdp.Debugger.SetBreakpointParams = {
+          location: { scriptId: script.scriptId, ...base1To0(loc) },
+          condition: fb.condition,
+        };
+        try {
+          await thread.cdp().Debugger.setBreakpoint(bpParams);
+          this.logger.info(
+            LogTag.Runtime,
+            `Function breakpoint set for ${name} at ${script.url}:${loc.lineNumber}:${loc.columnNumber}`,
+          );
+        } catch (e) {
+          this.logger.error(LogTag.Runtime, `Error setting function breakpoint for ${name}`, e);
+        }
+      }
     }
   }
 }
