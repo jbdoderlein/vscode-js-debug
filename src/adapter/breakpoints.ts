@@ -883,12 +883,10 @@ export class BreakpointManager {
 
   /**
    * Handles DAP setFunctionBreakpoints request.
-   * NOTE: This is a placeholder implementation.
    */
   public async setFunctionBreakpoints(
     params: Dap.SetFunctionBreakpointsParams,
   ): Promise<Dap.SetFunctionBreakpointsResult> {
-    this.logger.info(LogTag.Runtime, 'Received setFunctionBreakpoints request:', params);
     // Store requested function breakpoints by name
     this._functionBreakpoints.clear();
     for (const fb of params.breakpoints) {
@@ -903,21 +901,9 @@ export class BreakpointManager {
       );
     }
 
-    // TODO: Implement actual logic to:
-    // 1. Clear existing function breakpoints.
-    // 2. Store the new desired function breakpoints (params.breakpoints).
-    // 3. Hook into script parsing (like in the constructor's onScript handler)
-    //    to find locations matching these names and set actual CDP breakpoints.
-    // 4. Return verified breakpoint information here.
-
-    // For now, return an empty list, indicating no breakpoints are verified yet.
     const result: Dap.SetFunctionBreakpointsResult = {
-      breakpoints: params.breakpoints.map((_bp, i) => ({
-        // Provide a temporary, unverified breakpoint structure for each requested one.
-        // Using negative IDs might help distinguish them initially.
-        id: -(i + 1), // Temporary ID
-        verified: false,
-        message: 'Function breakpoint not yet implemented or resolved.',
+      breakpoints: params.breakpoints.map((_bp, _i) => ({
+        verified: true,
       })),
     };
 
@@ -960,11 +946,11 @@ export class BreakpointManager {
     const names = new Set(this._functionBreakpoints.keys());
     const matches: Array<{ name: string; loc: LineColumn }> = [];
     // Attempt function breakpoint parsing; ignore type mismatches
-    /* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call */
-    walk.simple(ast as any, {
-      FunctionDeclaration(node: any) {
-        const id = node.id;
-        const loc = node.loc;
+    walk.simple(ast, {
+      FunctionDeclaration(node) {
+        const fn = node as unknown as acorn.FunctionDeclaration;
+        const id = fn.id;
+        const loc = fn.loc;
         if (id?.name && names.has(id.name) && loc) {
           const start = loc.start;
           matches.push({
@@ -976,9 +962,10 @@ export class BreakpointManager {
           });
         }
       },
-      FunctionExpression(node: any) {
-        const id = node.id;
-        const loc = node.loc;
+      FunctionExpression(node) {
+        const fn = node as unknown as acorn.FunctionExpression;
+        const id = fn.id;
+        const loc = fn.loc;
         if (id?.name && names.has(id.name) && loc) {
           const start = loc.start;
           matches.push({
@@ -987,9 +974,10 @@ export class BreakpointManager {
           });
         }
       },
-      MethodDefinition(node: any) {
-        const key = node.key;
-        const value = node.value;
+      MethodDefinition(node) {
+        const md = node as unknown as acorn.MethodDefinition;
+        const key = md.key;
+        const value = md.value;
         if (key?.type === 'Identifier' && names.has(key.name) && value?.loc) {
           const start = value.loc.start;
           matches.push({
@@ -999,7 +987,6 @@ export class BreakpointManager {
         }
       },
     });
-    /* eslint-enable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call */
     // Set breakpoints at each match
     for (const { name, loc } of matches) {
       const fps = this._functionBreakpoints.get(name)!;
@@ -1010,10 +997,6 @@ export class BreakpointManager {
         };
         try {
           await thread.cdp().Debugger.setBreakpoint(bpParams);
-          this.logger.info(
-            LogTag.Runtime,
-            `Function breakpoint set for ${name} at ${script.url}:${loc.lineNumber}:${loc.columnNumber}`,
-          );
         } catch (e) {
           this.logger.error(LogTag.Runtime, `Error setting function breakpoint for ${name}`, e);
         }

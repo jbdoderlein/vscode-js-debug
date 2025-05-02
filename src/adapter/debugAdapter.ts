@@ -81,7 +81,7 @@ export class DebugAdapter implements IDisposable {
     this.dap = dap;
     this.dap.on('initialize', params => this.onInitialize(params));
     this.dap.on('setBreakpoints', params => this._onSetBreakpoints(params));
-    this.dap.on('setExceptionBreakpoints', params => this._onSetExceptionBreakpoints(params));
+    this.dap.on('setExceptionBreakpoints', params => this.setExceptionBreakpoints(params));
     this.dap.on('setFunctionBreakpoints', params => this._onSetFunctionBreakpoints(params));
     this.dap.on('configurationDone', () => this.configurationDone());
     this.dap.on('loadedSources', () => this._onLoadedSources());
@@ -278,7 +278,7 @@ export class DebugAdapter implements IDisposable {
   static capabilities(extended = false): Dap.CapabilitiesExtended {
     return {
       supportsConfigurationDoneRequest: true,
-      supportsFunctionBreakpoints: true,
+      supportsFunctionBreakpoints: extended,
       supportsConditionalBreakpoints: true,
       supportsHitConditionalBreakpoints: true,
       supportsEvaluateForHovers: true,
@@ -321,7 +321,7 @@ export class DebugAdapter implements IDisposable {
       supportsLogPoints: true,
       supportsTerminateThreadsRequest: false,
       supportsSetExpression: true,
-      supportsTerminateRequest: true,
+      supportsTerminateRequest: extended,
       completionTriggerCharacters: ['.', '[', '"', "'"],
       supportsBreakpointLocationsRequest: true,
       supportsClipboardContext: true,
@@ -344,22 +344,13 @@ export class DebugAdapter implements IDisposable {
     );
   }
 
-  private async _onSetExceptionBreakpoints(
+  async setExceptionBreakpoints(
     params: Dap.SetExceptionBreakpointsParams,
   ): Promise<Dap.SetExceptionBreakpointsResult | Dap.Error> {
     await this._services.get<IExceptionPauseService>(IExceptionPauseService).setBreakpoints(
       params,
     );
     return {};
-  }
-
-  /**
-   * Public API to set exception breakpoints (for initial configuration).
-   */
-  public setExceptionBreakpoints(
-    params: Dap.SetExceptionBreakpointsParams,
-  ): Promise<Dap.SetExceptionBreakpointsResult | Dap.Error> {
-    return this._onSetExceptionBreakpoints(params);
   }
 
   private async _onSetFunctionBreakpoints(
